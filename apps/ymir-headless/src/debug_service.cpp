@@ -1,0 +1,416 @@
+#include "debug_service.hpp"
+
+#include <protocol/json_rpc_adapter.hpp>
+
+#include <ymir/debug/protocol/debug_command.hpp>
+#include <ymir/debug/protocol/protocol_version.hpp>
+#include <ymir/media/loader/loader.hpp>
+#include <ymir/version.hpp>
+
+#include <algorithm>
+#include <charconv>
+#include <cstdint>
+#include <fstream>
+#include <initializer_list>
+#include <limits>
+#include <span>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+namespace ymir::debug {
+
+namespace {
+
+    constexpr uint32_t kMaxPeekBytes = 64_KiB;
+
+    const std::vector<std::string> &Capabilities() {
+        static const std::vector<std::string> capabilities{
+            "sh2.master", "sh2.slave", "exec.stepi",      "exec.reset",
+            "regs.read",  "mem.peek",  "instance.status", "instance.shutdown",
+        };
+        return capabilities;
+    }
+
+    bool HasOnlyKeys(const nlohmann::json &params, std::initializer_list<std::string_view> allowedKeys) {
+        if (!params.is_object()) {
+            return false;
+        }
+        for (const auto &[key, value] : params.items()) {
+            (void)value;
+            const bool allowed = std::ranges::any_of(allowedKeys, [&](std::string_view item) { return item == key; });
+            if (!allowed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool HasNoParams(const nlohmann::json &params) {
+        return (params.is_object() || params.is_array()) && params.empty();
+    }
+
+    std::optional<uint32_t> ParseUint32(const nlohmann::json &value) {
+        if (value.is_number_unsigned()) {
+            const auto number = value.get<uint64_t>();
+            if (number <= std::numeric_limits<uint32_t>::max()) {
+                return static_cast<uint32_t>(number);
+            }
+            return std::nullopt;
+        }
+        if (value.is_number_integer()) {
+            const auto number = value.get<int64_t>();
+            if (number >= 0 && static_cast<uint64_t>(number) <= std::numeric_limits<uint32_t>::max()) {
+                return static_cast<uint32_t>(number);
+            }
+            return std::nullopt;
+        }
+        if (!value.is_string()) {
+            return std::nullopt;
+        }
+
+        const std::string &text = value.get_ref<const std::string &>();
+        std::string_view digits{text};
+        int base = 10;
+        if (digits.starts_with("0x") || digits.starts_with("0X")) {
+            digits.remove_prefix(2);
+            base = 16;
+        }
+        if (digits.empty()) {
+            return std::nullopt;
+        }
+
+        uint32_t number{};
+        const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), number, base);
+        if (error != std::errc{} || end != digits.data() + digits.size()) {
+            return std::nullopt;
+        }
+        return number;
+    }
+
+    std::optional<DebugTarget> ParseTarget(const nlohmann::json &params) {
+        if (!params.contains("target")) {
+            return DebugTarget::Sh2Master;
+        }
+        if (!params["target"].is_string()) {
+            return std::nullopt;
+        }
+        const std::string &target = params["target"].get_ref<const std::string &>();
+        if (target == ToString(DebugTarget::Sh2Master)) {
+            return DebugTarget::Sh2Master;
+        }
+        if (target == ToString(DebugTarget::Sh2Slave)) {
+            return DebugTarget::Sh2Slave;
+        }
+        return std::nullopt;
+    }
+
+    nlohmann::json TargetJson(DebugTarget target) {
+        return std::string{ToString(target)};
+    }
+
+} // namespace
+
+DebugService::DebugService(HeadlessConfig config)
+    : m_config(std::move(config))
+    , m_saturn(std::make_unique<ymir::Saturn>()) {}
+
+bool DebugService::Initialize(std::string &outError) {
+    outError.clear();
+    if (m_config.ipl_path.empty()) {
+        outError = "IPL path is required";
+        return false;
+    }
+
+    try {
+        std::ifstream iplFile{m_config.ipl_path, std::ios::binary | std::ios::ate};
+        if (!iplFile) {
+            outError = "failed to open IPL image: " + m_config.ipl_path.string();
+            return false;
+        }
+
+        const auto iplSize = iplFile.tellg();
+        if (iplSize != static_cast<std::streamoff>(ymir::sys::kIPLSize)) {
+            outError = "IPL size mismatch: expected " + std::to_string(ymir::sys::kIPLSize) + " bytes, got " +
+                       std::to_string(static_cast<std::streamoff>(iplSize));
+            return false;
+        }
+
+        std::vector<uint8_t> ipl(ymir::sys::kIPLSize);
+        iplFile.seekg(0);
+        if (!iplFile.read(reinterpret_cast<char *>(ipl.data()), static_cast<std::streamsize>(ipl.size()))) {
+            outError = "failed to read IPL image: " + m_config.ipl_path.string();
+            return false;
+        }
+        m_saturn->LoadIPL(std::span<uint8_t, ymir::sys::kIPLSize>{ipl.data(), ipl.size()});
+
+        if (m_config.bram_path) {
+            std::error_code error;
+            m_saturn->LoadInternalBackupMemoryImage(*m_config.bram_path, false, error);
+            if (error) {
+                outError = "failed to load backup RAM image '" + m_config.bram_path->string() + "': " + error.message();
+                return false;
+            }
+        }
+
+        if (m_config.game_path) {
+            ymir::media::Disc disc;
+            std::string loaderError;
+            const bool loaded = ymir::media::LoadDisc(
+                *m_config.game_path, disc, false, [&](ymir::media::MessageType type, std::string message) {
+                    if (type == ymir::media::MessageType::Error || type == ymir::media::MessageType::NotValid) {
+                        loaderError = std::move(message);
+                    }
+                });
+            if (!loaded) {
+                outError = "failed to load disc image '" + m_config.game_path->string() + "'";
+                if (!loaderError.empty()) {
+                    outError += ": " + loaderError;
+                }
+                return false;
+            }
+            m_saturn->LoadDisc(std::move(disc));
+        }
+
+        m_saturn->Reset(true);
+        m_state = ExecutionState::Paused;
+        return true;
+    } catch (const std::exception &error) {
+        outError = std::string{"initialization failed: "} + error.what();
+        m_state = ExecutionState::Crashed;
+        return false;
+    }
+}
+
+nlohmann::json DebugService::CreateReadyNotification() const {
+    const bool slaveEnabled = IsTargetEnabled(DebugTarget::Sh2Slave);
+    return JsonRpcAdapter::CreateNotification(
+        "instance.ready", {
+                              {"protocol", kProtocolName},
+                              {"protocol_version", kProtocolVersion},
+                              {"transport", kStdioJsonRpcLinesTransport},
+                              {"instance_id", m_instanceId},
+                              {"state", ToString(m_state)},
+                              {"capabilities", Capabilities()},
+                              {"targets",
+                               {{{"target", ToString(DebugTarget::Sh2Master)}, {"enabled", true}},
+                                {{"target", ToString(DebugTarget::Sh2Slave)}, {"enabled", slaveEnabled}}}},
+                          });
+}
+
+std::optional<nlohmann::json> DebugService::HandleLine(std::string_view line) {
+    nlohmann::json parseError;
+    auto request = JsonRpcAdapter::ParseRequest(line, parseError);
+    if (!request) {
+        return parseError;
+    }
+
+    nlohmann::json response;
+    try {
+        response = DispatchRequest(*request);
+    } catch (const nlohmann::json::exception &error) {
+        response = CreateDebugError(*request, JsonRpcError::InvalidParams, ErrorCode::InvalidParams, error.what());
+    } catch (const std::exception &error) {
+        response = CreateDebugError(*request, JsonRpcError::InternalError, ErrorCode::InternalError, error.what());
+    }
+
+    if (request->is_notification) {
+        return std::nullopt;
+    }
+    return response;
+}
+
+nlohmann::json DebugService::CreateDebugError(const JsonRpcRequest &request, JsonRpcError rpcError,
+                                              ErrorCode debugError, std::string_view message) const {
+    return JsonRpcAdapter::CreateErrorResponse(request.id, rpcError, message, {{"debug_code", ToString(debugError)}});
+}
+
+bool DebugService::IsTargetEnabled(DebugTarget target) const noexcept {
+    if (target == DebugTarget::Sh2Master) {
+        return true;
+    }
+    return m_config.slave_enabled && m_saturn->slaveSH2Enabled;
+}
+
+nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
+    const auto success = [&](nlohmann::json result) {
+        return JsonRpcAdapter::CreateSuccessResponse(request.id, result);
+    };
+    const auto invalidParams = [&](ErrorCode code, std::string_view message) {
+        return CreateDebugError(request, JsonRpcError::InvalidParams, code, message);
+    };
+    const auto serverError = [&](ErrorCode code, std::string_view message) {
+        return CreateDebugError(request, JsonRpcError::ServerError, code, message);
+    };
+    const auto requirePaused = [&]() -> std::optional<nlohmann::json> {
+        if (m_state != ExecutionState::Paused) {
+            return serverError(ErrorCode::InvalidState, "operation requires a paused instance");
+        }
+        return std::nullopt;
+    };
+
+    if (request.method == ToString(CommandMethod::DebugVersion)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "debug.version takes no parameters");
+        }
+        return success({
+            {"protocol", kProtocolName},
+            {"protocol_version", kProtocolVersion},
+            {"transport", kStdioJsonRpcLinesTransport},
+            {"application", {{"name", "ymir-headless"}, {"version", ymir::version::string}, {"git_sha", "unknown"}}},
+            {"capabilities", Capabilities()},
+        });
+    }
+
+    if (request.method == ToString(CommandMethod::InstanceStatus)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "instance.status takes no parameters");
+        }
+        return success({
+            {"protocol", kProtocolName},
+            {"instance_id", m_instanceId},
+            {"state", ToString(m_state)},
+            {"slave_enabled", IsTargetEnabled(DebugTarget::Sh2Slave)},
+            {"capabilities", Capabilities()},
+        });
+    }
+
+    if (request.method == ToString(CommandMethod::InstanceShutdown)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "instance.shutdown takes no parameters");
+        }
+        m_state = ExecutionState::Stopped;
+        m_shutdownRequested = true;
+        return success({{"state", ToString(m_state)}});
+    }
+
+    if (request.method == ToString(CommandMethod::ExecReset)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "exec.reset takes no parameters");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        m_saturn->Reset(true);
+        return success({{"state", ToString(m_state)}});
+    }
+
+    if (request.method == ToString(CommandMethod::ExecStepI)) {
+        if (!HasOnlyKeys(request.params, {"target"})) {
+            return invalidParams(ErrorCode::InvalidParams, "exec.stepi expects an object containing only target");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        const auto target = ParseTarget(request.params);
+        if (!target) {
+            return invalidParams(ErrorCode::InvalidTarget, "target must be sh2.master or sh2.slave");
+        }
+        if (!IsTargetEnabled(*target)) {
+            return serverError(ErrorCode::TargetDisabled, "target is not currently enabled");
+        }
+
+        auto &cpu = *target == DebugTarget::Sh2Master ? m_saturn->masterSH2 : m_saturn->slaveSH2;
+        const uint32_t pcBefore = cpu.GetProbe().PC();
+        const bool counterpartAdvanced = *target == DebugTarget::Sh2Slave || m_saturn->slaveSH2Enabled;
+        const uint64_t cycles =
+            *target == DebugTarget::Sh2Master ? m_saturn->StepMasterSH2() : m_saturn->StepSlaveSH2();
+        const uint32_t pcAfter = cpu.GetProbe().PC();
+
+        return success({
+            {"reason", ToString(StopReason::Step)},
+            {"target", TargetJson(*target)},
+            {"pc_before", pcBefore},
+            {"pc_after", pcAfter},
+            {"cycles_advanced",
+             static_cast<uint32_t>(std::min<uint64_t>(cycles, std::numeric_limits<uint32_t>::max()))},
+            {"counterpart_advanced", counterpartAdvanced},
+            {"breakpoint_id", nullptr},
+        });
+    }
+
+    if (request.method == ToString(CommandMethod::RegsRead)) {
+        if (!HasOnlyKeys(request.params, {"target"})) {
+            return invalidParams(ErrorCode::InvalidParams, "regs.read expects an object containing only target");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        const auto target = ParseTarget(request.params);
+        if (!target) {
+            return invalidParams(ErrorCode::InvalidTarget, "target must be sh2.master or sh2.slave");
+        }
+        if (!IsTargetEnabled(*target)) {
+            return serverError(ErrorCode::TargetDisabled, "target is not currently enabled");
+        }
+
+        const auto &cpu = *target == DebugTarget::Sh2Master ? m_saturn->masterSH2 : m_saturn->slaveSH2;
+        const auto &probe = cpu.GetProbe();
+        const auto sr = probe.SR();
+        const auto mac = probe.MAC();
+        nlohmann::json registers = nlohmann::json::array();
+        for (const uint32_t value : probe.R()) {
+            registers.push_back(value);
+        }
+
+        return success({
+            {"target", TargetJson(*target)},
+            {"r", std::move(registers)},
+            {"pc", probe.PC()},
+            {"pr", probe.PR()},
+            {"sr", sr.u32},
+            {"sr_t", static_cast<bool>(sr.T)},
+            {"sr_s", static_cast<bool>(sr.S)},
+            {"sr_ilevel", sr.ILevel},
+            {"sr_q", static_cast<bool>(sr.Q)},
+            {"sr_m", static_cast<bool>(sr.M)},
+            {"gbr", probe.GBR()},
+            {"vbr", probe.VBR()},
+            {"mach", mac.H},
+            {"macl", mac.L},
+            {"is_delay_slot", probe.IsInDelaySlot()},
+        });
+    }
+
+    if (request.method == ToString(CommandMethod::MemPeek)) {
+        if (!HasOnlyKeys(request.params, {"target", "address", "count"}) || !request.params.contains("address") ||
+            !request.params.contains("count")) {
+            return invalidParams(ErrorCode::InvalidParams, "mem.peek expects target (optional), address and count");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        const auto target = ParseTarget(request.params);
+        if (!target) {
+            return invalidParams(ErrorCode::InvalidTarget, "target must be sh2.master or sh2.slave");
+        }
+        if (!IsTargetEnabled(*target)) {
+            return serverError(ErrorCode::TargetDisabled, "target is not currently enabled");
+        }
+
+        const auto address = ParseUint32(request.params["address"]);
+        const auto count = ParseUint32(request.params["count"]);
+        if (!address || !count || *count == 0 || *count > kMaxPeekBytes) {
+            return invalidParams(ErrorCode::MemoryOutOfRange, "count must be between 1 and 65536 bytes");
+        }
+        if (*address > std::numeric_limits<uint32_t>::max() - (*count - 1)) {
+            return invalidParams(ErrorCode::MemoryOutOfRange, "memory range wraps the 32-bit address space");
+        }
+
+        const auto &cpu = *target == DebugTarget::Sh2Master ? m_saturn->masterSH2 : m_saturn->slaveSH2;
+        const auto &probe = cpu.GetProbe();
+        nlohmann::json data = nlohmann::json::array();
+        for (uint32_t offset = 0; offset < *count; ++offset) {
+            data.push_back(probe.MemPeekByte(*address + offset, true));
+        }
+        return success({
+            {"target", TargetJson(*target)},
+            {"address", *address},
+            {"data", std::move(data)},
+        });
+    }
+
+    return JsonRpcAdapter::CreateMethodNotFoundResponse(request.id, request.method);
+}
+
+} // namespace ymir::debug

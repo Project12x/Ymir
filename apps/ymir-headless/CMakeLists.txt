@@ -1,7 +1,25 @@
+find_package(tomlplusplus CONFIG REQUIRED)
+
+## Create the emulator-backed debug service shared by the worker and its tests
+add_library(ymir-headless-service STATIC
+    src/debug_service.cpp
+    src/toml_implementation.cpp
+)
+add_library(ymir::ymir-headless-service ALIAS ymir-headless-service)
+
+target_include_directories(ymir-headless-service
+    PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
+)
+target_compile_features(ymir-headless-service PUBLIC cxx_std_20)
+target_link_libraries(ymir-headless-service PUBLIC
+    ymir::ymir-core
+    ymir::ymir-dbg-commons
+    tomlplusplus::tomlplusplus
+)
+
 ## Create the executable target
 add_executable(ymir-headless
     src/main.cpp
-    src/toml_implementation.cpp
 )
 add_executable(ymir::ymir-headless ALIAS ymir-headless)
 
@@ -15,14 +33,10 @@ target_include_directories(ymir-headless
 
 target_compile_features(ymir-headless PUBLIC cxx_std_20)
 
-find_package(tomlplusplus CONFIG REQUIRED)
-
 ## Add dependencies
 target_link_libraries(ymir-headless PRIVATE
-    ymir::ymir-core
-    ymir::ymir-dbg-commons
+    ymir::ymir-headless-service
     fmt::fmt
-    tomlplusplus::tomlplusplus
 )
 
 cmrk_copy_runtime_dlls(ymir-headless)
@@ -43,6 +57,8 @@ endif ()
 
 ## Configure Visual Studio solution
 if (MSVC)
+    vs_set_filters(TARGET ymir-headless-service)
     vs_set_filters(TARGET ymir-headless)
+    set_target_properties(ymir-headless-service PROPERTIES FOLDER "Ymir")
     set_target_properties(ymir-headless PROPERTIES FOLDER "Ymir")
 endif ()

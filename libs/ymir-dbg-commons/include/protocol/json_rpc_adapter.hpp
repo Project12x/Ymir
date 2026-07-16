@@ -45,6 +45,7 @@ enum class JsonRpcError : int {
     MethodNotFound = -32601,
     InvalidParams = -32602,
     InternalError = -32603,
+    ServerError = -32000,
 };
 
 class JsonRpcAdapter {

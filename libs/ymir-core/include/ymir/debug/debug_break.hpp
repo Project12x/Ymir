@@ -90,7 +90,7 @@ struct DebugBreakInfo {
 };
 
 /// @brief Invoked when a debug break signal is raised.
-using CBDebugBreakRaised = util::OptionalCallback<void(const DebugBreakInfo &info)>;
+using CBDebugBreakRaised = ::util::OptionalCallback<void(const DebugBreakInfo &info)>;
 
 /// @brief Manages the debug break signal.
 class DebugBreakManager {

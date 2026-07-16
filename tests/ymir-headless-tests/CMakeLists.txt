@@ -1,6 +1,7 @@
 add_executable(ymir-headless-tests
     src/config_tests.cpp
     src/config_parser_tests.cpp
+    src/debug_service_tests.cpp
     src/smoke_tests.cpp
     src/protocol_tests.cpp
 )
@@ -19,9 +20,14 @@ find_package(tomlplusplus CONFIG REQUIRED)
 
 target_link_libraries(ymir-headless-tests PRIVATE
     Catch2::Catch2WithMain
+    ymir::ymir-headless-service
     ymir::ymir-dbg-commons
     tomlplusplus::tomlplusplus
 )
+target_compile_definitions(ymir-headless-tests PRIVATE
+    YMIR_HEADLESS_TEST_BINARY="$<TARGET_FILE:ymir-headless>"
+)
+add_dependencies(ymir-headless-tests ymir-headless)
 # nlohmann_json is provided transitively via ymir-dbg-commons.
 
 cmrk_copy_runtime_dlls(ymir-headless-tests)
