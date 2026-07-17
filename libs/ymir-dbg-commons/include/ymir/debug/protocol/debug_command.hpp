@@ -16,6 +16,7 @@ enum class CommandMethod {
     InstanceShutdown,
     ExecContinue,
     ExecPause,
+    ExecRunFor,
     ExecStepI,
     ExecReset,
     RegsRead,
@@ -34,6 +35,7 @@ constexpr std::string_view ToString(CommandMethod m) {
     case CommandMethod::InstanceShutdown: return "instance.shutdown";
     case CommandMethod::ExecContinue: return "exec.continue";
     case CommandMethod::ExecPause: return "exec.pause";
+    case CommandMethod::ExecRunFor: return "exec.run_for";
     case CommandMethod::ExecStepI: return "exec.stepi";
     case CommandMethod::ExecReset: return "exec.reset";
     case CommandMethod::RegsRead: return "regs.read";
@@ -85,8 +87,13 @@ struct ExecStepIParams {
     DebugTarget target{DebugTarget::Sh2Master};
 };
 
-using DebugCommandParams = std::variant<std::monostate, RegsReadParams, MemPeekParams, DisasmAtParams,
-                                        BreakpointSetParams, BreakpointListParams, BreakpointIdParams, ExecStepIParams>;
+struct ExecRunForParams {
+    uint32_t frames{1};
+};
+
+using DebugCommandParams =
+    std::variant<std::monostate, RegsReadParams, MemPeekParams, DisasmAtParams, BreakpointSetParams,
+                 BreakpointListParams, BreakpointIdParams, ExecStepIParams, ExecRunForParams>;
 
 struct DebugCommand {
     DebugRequestId request_id;

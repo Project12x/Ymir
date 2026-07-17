@@ -23,11 +23,12 @@ namespace ymir::debug {
 namespace {
 
     constexpr uint32_t kMaxPeekBytes = 64_KiB;
+    constexpr uint32_t kMaxRunForFrames = 3600;
 
     const std::vector<std::string> &Capabilities() {
         static const std::vector<std::string> capabilities{
-            "sh2.master", "sh2.slave", "exec.stepi",      "exec.reset",
-            "regs.read",  "mem.peek",  "instance.status", "instance.shutdown",
+            "sh2.master", "sh2.slave", "exec.continue", "exec.pause",      "exec.run_for",      "exec.stepi",
+            "exec.reset", "regs.read", "mem.peek",      "instance.status", "instance.shutdown", "event.stopped",
         };
         return capabilities;
     }
@@ -115,6 +116,10 @@ DebugService::DebugService(HeadlessConfig config)
     : m_config(std::move(config))
     , m_saturn(std::make_unique<ymir::Saturn>()) {}
 
+DebugService::~DebugService() {
+    StopExecutionThread();
+}
+
 bool DebugService::Initialize(std::string &outError) {
     outError.clear();
     if (m_config.ipl_path.empty()) {
@@ -173,11 +178,13 @@ bool DebugService::Initialize(std::string &outError) {
         }
 
         m_saturn->Reset(true);
-        m_state = ExecutionState::Paused;
+        m_slaveTargetEnabled.store(IsTargetEnabled(DebugTarget::Sh2Slave), std::memory_order_release);
+        m_state.store(ExecutionState::Paused, std::memory_order_release);
+        StartExecutionThread();
         return true;
     } catch (const std::exception &error) {
         outError = std::string{"initialization failed: "} + error.what();
-        m_state = ExecutionState::Crashed;
+        m_state.store(ExecutionState::Crashed, std::memory_order_release);
         return false;
     }
 }
@@ -190,7 +197,7 @@ nlohmann::json DebugService::CreateReadyNotification() const {
                               {"protocol_version", kProtocolVersion},
                               {"transport", kStdioJsonRpcLinesTransport},
                               {"instance_id", m_instanceId},
-                              {"state", ToString(m_state)},
+                              {"state", ToString(GetState())},
                               {"capabilities", Capabilities()},
                               {"targets",
                                {{{"target", ToString(DebugTarget::Sh2Master)}, {"enabled", true}},
@@ -220,6 +227,13 @@ std::optional<nlohmann::json> DebugService::HandleLine(std::string_view line) {
     return response;
 }
 
+std::vector<nlohmann::json> DebugService::TakePendingNotifications() {
+    std::lock_guard lock{m_executionMutex};
+    std::vector<nlohmann::json> notifications;
+    notifications.swap(m_pendingNotifications);
+    return notifications;
+}
+
 nlohmann::json DebugService::CreateDebugError(const JsonRpcRequest &request, JsonRpcError rpcError,
                                               ErrorCode debugError, std::string_view message) const {
     return JsonRpcAdapter::CreateErrorResponse(request.id, rpcError, message, {{"debug_code", ToString(debugError)}});
@@ -229,7 +243,90 @@ bool DebugService::IsTargetEnabled(DebugTarget target) const noexcept {
     if (target == DebugTarget::Sh2Master) {
         return true;
     }
+    if (m_executionThread.joinable()) {
+        return m_slaveTargetEnabled.load(std::memory_order_acquire);
+    }
     return m_config.slave_enabled && m_saturn->slaveSH2Enabled;
+}
+
+void DebugService::StartExecutionThread() {
+    std::lock_guard lock{m_executionMutex};
+    if (m_executionThread.joinable()) {
+        return;
+    }
+    m_workerStopRequested = false;
+    m_executionThread = std::thread{[this] { ExecutionThreadMain(); }};
+}
+
+void DebugService::StopExecutionThread() {
+    {
+        std::lock_guard lock{m_executionMutex};
+        m_workerStopRequested = true;
+        m_continueRequested = false;
+        m_pauseRequested = false;
+    }
+    m_executionCondition.notify_all();
+    m_pausedCondition.notify_all();
+    if (m_executionThread.joinable()) {
+        m_executionThread.join();
+    }
+}
+
+void DebugService::QueueStoppedNotificationLocked(StopReason reason) {
+    ++m_stopSequence;
+    m_pendingNotifications.push_back(
+        JsonRpcAdapter::CreateNotification("instance.stopped", {
+                                                                   {"instance_id", m_instanceId},
+                                                                   {"reason", ToString(reason)},
+                                                                   {"target", ToString(DebugTarget::Sh2Master)},
+                                                                   {"pc", m_saturn->masterSH2.GetProbe().PC()},
+                                                                   {"sequence", m_stopSequence},
+                                                               }));
+}
+
+void DebugService::ExecutionThreadMain() {
+    for (;;) {
+        std::unique_lock lock{m_executionMutex};
+        m_executionCondition.wait(lock, [&] { return m_workerStopRequested || m_continueRequested; });
+        if (m_workerStopRequested) {
+            return;
+        }
+
+        if (m_pauseRequested) {
+            m_continueRequested = false;
+            m_pauseRequested = false;
+            m_state.store(ExecutionState::Paused, std::memory_order_release);
+            QueueStoppedNotificationLocked(StopReason::Pause);
+            lock.unlock();
+            m_pausedCondition.notify_all();
+            continue;
+        }
+
+        lock.unlock();
+        try {
+            m_saturn->RunFrame();
+            m_slaveTargetEnabled.store(m_config.slave_enabled && m_saturn->slaveSH2Enabled, std::memory_order_release);
+        } catch (...) {
+            lock.lock();
+            m_continueRequested = false;
+            m_pauseRequested = false;
+            m_state.store(ExecutionState::Crashed, std::memory_order_release);
+            QueueStoppedNotificationLocked(StopReason::Error);
+            lock.unlock();
+            m_pausedCondition.notify_all();
+            return;
+        }
+
+        lock.lock();
+        if (m_pauseRequested) {
+            m_continueRequested = false;
+            m_pauseRequested = false;
+            m_state.store(ExecutionState::Paused, std::memory_order_release);
+            QueueStoppedNotificationLocked(StopReason::Pause);
+            lock.unlock();
+            m_pausedCondition.notify_all();
+        }
+    }
 }
 
 nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
@@ -243,7 +340,7 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
         return CreateDebugError(request, JsonRpcError::ServerError, code, message);
     };
     const auto requirePaused = [&]() -> std::optional<nlohmann::json> {
-        if (m_state != ExecutionState::Paused) {
+        if (GetState() != ExecutionState::Paused) {
             return serverError(ErrorCode::InvalidState, "operation requires a paused instance");
         }
         return std::nullopt;
@@ -269,7 +366,7 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
         return success({
             {"protocol", kProtocolName},
             {"instance_id", m_instanceId},
-            {"state", ToString(m_state)},
+            {"state", ToString(GetState())},
             {"slave_enabled", IsTargetEnabled(DebugTarget::Sh2Slave)},
             {"capabilities", Capabilities()},
         });
@@ -279,9 +376,83 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
         if (!HasNoParams(request.params)) {
             return invalidParams(ErrorCode::InvalidParams, "instance.shutdown takes no parameters");
         }
-        m_state = ExecutionState::Stopped;
-        m_shutdownRequested = true;
-        return success({{"state", ToString(m_state)}});
+        StopExecutionThread();
+        m_state.store(ExecutionState::Stopped, std::memory_order_release);
+        m_shutdownRequested.store(true, std::memory_order_release);
+        return success({{"state", ToString(GetState())}});
+    }
+
+    if (request.method == ToString(CommandMethod::ExecContinue)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "exec.continue takes no parameters");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+
+        {
+            std::lock_guard lock{m_executionMutex};
+            m_pauseRequested = false;
+            m_continueRequested = true;
+            m_state.store(ExecutionState::Running, std::memory_order_release);
+        }
+        m_executionCondition.notify_one();
+        return success({{"state", ToString(GetState())}});
+    }
+
+    if (request.method == ToString(CommandMethod::ExecPause)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "exec.pause takes no parameters");
+        }
+
+        std::unique_lock lock{m_executionMutex};
+        if (GetState() != ExecutionState::Running || !m_continueRequested) {
+            return serverError(ErrorCode::InvalidState, "operation requires a continuously running instance");
+        }
+        m_pauseRequested = true;
+        m_executionCondition.notify_one();
+        m_pausedCondition.wait(lock, [&] { return m_workerStopRequested || GetState() != ExecutionState::Running; });
+        if (GetState() == ExecutionState::Crashed) {
+            return serverError(ErrorCode::InternalError, "emulator execution failed while pausing");
+        }
+        return success({{"state", ToString(GetState())}});
+    }
+
+    if (request.method == ToString(CommandMethod::ExecRunFor)) {
+        if (!HasOnlyKeys(request.params, {"frames"}) || !request.params.contains("frames")) {
+            return invalidParams(ErrorCode::InvalidParams, "exec.run_for expects an object containing frames");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        const auto frames = ParseUint32(request.params["frames"]);
+        if (!frames || *frames == 0 || *frames > kMaxRunForFrames) {
+            return invalidParams(ErrorCode::InvalidParams, "frames must be between 1 and 3600");
+        }
+
+        uint32_t framesAdvanced = 0;
+        m_state.store(ExecutionState::Running, std::memory_order_release);
+        try {
+            for (; framesAdvanced < *frames; ++framesAdvanced) {
+                m_saturn->RunFrame();
+            }
+            m_slaveTargetEnabled.store(m_config.slave_enabled && m_saturn->slaveSH2Enabled, std::memory_order_release);
+            m_state.store(ExecutionState::Paused, std::memory_order_release);
+            std::lock_guard lock{m_executionMutex};
+            QueueStoppedNotificationLocked(StopReason::FrameLimit);
+        } catch (...) {
+            m_state.store(ExecutionState::Crashed, std::memory_order_release);
+            std::lock_guard lock{m_executionMutex};
+            QueueStoppedNotificationLocked(StopReason::Error);
+            throw;
+        }
+
+        return success({
+            {"state", ToString(GetState())},
+            {"reason", ToString(StopReason::FrameLimit)},
+            {"frames_requested", *frames},
+            {"frames_advanced", framesAdvanced},
+        });
     }
 
     if (request.method == ToString(CommandMethod::ExecReset)) {
@@ -292,7 +463,8 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
             return *error;
         }
         m_saturn->Reset(true);
-        return success({{"state", ToString(m_state)}});
+        m_slaveTargetEnabled.store(m_config.slave_enabled && m_saturn->slaveSH2Enabled, std::memory_order_release);
+        return success({{"state", ToString(GetState())}});
     }
 
     if (request.method == ToString(CommandMethod::ExecStepI)) {

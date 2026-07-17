@@ -72,15 +72,16 @@ TEST_CASE("DebugService reports the implemented protocol surface", "[debug-servi
     REQUIRE(response.has_value());
     CHECK((*response)["id"] == 7);
     CHECK((*response)["result"]["protocol"] == "ymir-debug");
-    CHECK((*response)["result"]["protocol_version"] == "0.1.0");
-    CHECK((*response)["result"]["capabilities"] == nlohmann::json{"sh2.master", "sh2.slave", "exec.stepi", "exec.reset",
-                                                                  "regs.read", "mem.peek", "instance.status",
-                                                                  "instance.shutdown"});
+    CHECK((*response)["result"]["protocol_version"] == "0.2.0");
+    CHECK((*response)["result"]["capabilities"] ==
+          nlohmann::json{"sh2.master", "sh2.slave", "exec.continue", "exec.pause", "exec.run_for", "exec.stepi",
+                         "exec.reset", "regs.read", "mem.peek", "instance.status", "instance.shutdown",
+                         "event.stopped"});
 
     const auto notification = service.HandleLine(R"({"jsonrpc":"2.0","method":"debug.version"})");
     CHECK_FALSE(notification.has_value());
 
-    const auto unsupported = service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.continue","id":8})");
+    const auto unsupported = service.HandleLine(R"({"jsonrpc":"2.0","method":"disasm.at","id":8})");
     REQUIRE(unsupported.has_value());
     CHECK((*unsupported)["error"]["code"] == static_cast<int>(ymir::debug::JsonRpcError::MethodNotFound));
 }
@@ -124,10 +125,59 @@ TEST_CASE("DebugService loads an IPL and exposes paused SH-2 state", "[debug-ser
     CHECK((*step)["result"]["target"] == "sh2.master");
     CHECK((*step)["result"]["cycles_advanced"].get<uint32_t>() > 0);
 
+    const auto runFor =
+        service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.run_for","params":{"frames":2},"id":"run-for"})");
+    REQUIRE(runFor.has_value());
+    CHECK((*runFor)["result"]["state"] == "paused");
+    CHECK((*runFor)["result"]["reason"] == "frame_limit");
+    CHECK((*runFor)["result"]["frames_advanced"] == 2);
+
+    auto notifications = service.TakePendingNotifications();
+    REQUIRE(notifications.size() == 1);
+    CHECK(notifications[0]["method"] == "instance.stopped");
+    CHECK(notifications[0]["params"]["reason"] == "frame_limit");
+    CHECK(notifications[0]["params"]["sequence"] == 1);
+
+    const auto resume = service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.continue","id":"resume"})");
+    REQUIRE(resume.has_value());
+    CHECK((*resume)["result"]["state"] == "running");
+
+    const auto runningStatus = service.HandleLine(R"({"jsonrpc":"2.0","method":"instance.status","id":"status"})");
+    REQUIRE(runningStatus.has_value());
+    CHECK((*runningStatus)["result"]["state"] == "running");
+
+    const auto duplicateResume =
+        service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.continue","id":"duplicate-resume"})");
+    REQUIRE(duplicateResume.has_value());
+    CHECK((*duplicateResume)["error"]["data"]["debug_code"] == "invalid_state");
+
+    const auto readWhileRunning =
+        service.HandleLine(R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":"busy"})");
+    REQUIRE(readWhileRunning.has_value());
+    CHECK((*readWhileRunning)["error"]["data"]["debug_code"] == "invalid_state");
+
+    const auto pause = service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.pause","id":"pause"})");
+    REQUIRE(pause.has_value());
+    CHECK((*pause)["result"]["state"] == "paused");
+    notifications = service.TakePendingNotifications();
+    REQUIRE(notifications.size() == 1);
+    CHECK(notifications[0]["params"]["reason"] == "pause");
+    CHECK(notifications[0]["params"]["sequence"] == 2);
+
+    const auto invalidRunFor = service.HandleLine(
+        R"({"jsonrpc":"2.0","method":"exec.run_for","params":{"frames":3601},"id":"too-many-frames"})");
+    REQUIRE(invalidRunFor.has_value());
+    CHECK((*invalidRunFor)["error"]["data"]["debug_code"] == "invalid_params");
+
     const auto badRange =
         service.HandleLine(R"({"jsonrpc":"2.0","method":"mem.peek","params":{"address":0,"count":65537},"id":10})");
     REQUIRE(badRange.has_value());
     CHECK((*badRange)["error"]["data"]["debug_code"] == "memory_out_of_range");
+
+    const auto resumeForShutdown =
+        service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.continue","id":"resume-for-shutdown"})");
+    REQUIRE(resumeForShutdown.has_value());
+    CHECK((*resumeForShutdown)["result"]["state"] == "running");
 
     const auto shutdown = service.HandleLine(R"({"jsonrpc":"2.0","method":"instance.shutdown","id":11})");
     REQUIRE(shutdown.has_value());
@@ -146,7 +196,11 @@ TEST_CASE("ymir-headless reserves stdout for JSON-RPC", "[debug-service][process
         output << R"({"jsonrpc":"2.0","method":"debug.version","id":1})" << '\n';
         output << R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":2})" << '\n';
         output << R"({"jsonrpc":"2.0","method":"exec.stepi","params":{"target":"sh2.master"},"id":3})" << '\n';
-        output << R"({"jsonrpc":"2.0","method":"instance.shutdown","id":4})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"exec.run_for","params":{"frames":1},"id":4})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"exec.continue","id":5})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":6})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"exec.pause","id":7})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"instance.shutdown","id":8})" << '\n';
     }
 
     const std::filesystem::path executable{YMIR_HEADLESS_TEST_BINARY};
@@ -166,11 +220,24 @@ TEST_CASE("ymir-headless reserves stdout for JSON-RPC", "[debug-service][process
         REQUIRE_NOTHROW(messages.push_back(nlohmann::json::parse(line)));
     }
 
-    REQUIRE(messages.size() == 5);
+    REQUIRE(messages.size() == 11);
     CHECK(messages[0]["method"] == "instance.ready");
-    for (int id = 1; id <= 4; ++id) {
-        CHECK(messages[static_cast<size_t>(id)]["id"] == id);
+
+    std::vector<int> responseIds;
+    std::vector<std::string> stopReasons;
+    for (const auto &message : messages) {
+        if (message.contains("id") && message["id"].is_number_integer()) {
+            responseIds.push_back(message["id"].get<int>());
+        }
+        if (message.value("method", std::string{}) == "instance.stopped") {
+            stopReasons.push_back(message["params"]["reason"].get<std::string>());
+        }
     }
+    CHECK(responseIds == std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8});
+    CHECK(stopReasons == std::vector<std::string>{"frame_limit", "pause"});
+    CHECK(messages[4]["id"] == 4);
+    CHECK(messages[5]["method"] == "instance.stopped");
+    CHECK(messages[9]["method"] == "instance.stopped");
 
     std::ifstream diagnostics{diagnosticOutput.path};
     const std::string diagnosticText{std::istreambuf_iterator<char>{diagnostics}, {}};

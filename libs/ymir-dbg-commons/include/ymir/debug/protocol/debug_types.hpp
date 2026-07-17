@@ -43,6 +43,7 @@ enum class StopReason {
     Watchpoint,
     Step,
     Pause,
+    FrameLimit,
     Exception,
     Shutdown,
     Exited,
@@ -55,6 +56,7 @@ constexpr std::string_view ToString(StopReason r) {
     case StopReason::Watchpoint: return "watchpoint";
     case StopReason::Step: return "step";
     case StopReason::Pause: return "pause";
+    case StopReason::FrameLimit: return "frame_limit";
     case StopReason::Exception: return "exception";
     case StopReason::Shutdown: return "shutdown";
     case StopReason::Exited: return "exited";

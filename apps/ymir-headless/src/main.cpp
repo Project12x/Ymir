@@ -146,6 +146,9 @@ int main(int argc, char **argv) {
             if (auto response = service.HandleLine(line)) {
                 protocolWriter.Write(*response);
             }
+            for (const auto &notification : service.TakePendingNotifications()) {
+                protocolWriter.Write(notification);
+            }
         },
         [&](ymir::debug::LineFramerError) {
             protocolWriter.Write(ymir::debug::JsonRpcAdapter::CreateErrorResponse(
