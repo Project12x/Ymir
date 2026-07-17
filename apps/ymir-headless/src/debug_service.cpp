@@ -4,6 +4,7 @@
 
 #include <ymir/debug/protocol/debug_command.hpp>
 #include <ymir/debug/protocol/protocol_version.hpp>
+#include <ymir/hw/vdp/vdp2_defs.hpp>
 #include <ymir/media/loader/loader.hpp>
 #include <ymir/version.hpp>
 
@@ -27,8 +28,9 @@ namespace {
 
     const std::vector<std::string> &Capabilities() {
         static const std::vector<std::string> capabilities{
-            "sh2.master", "sh2.slave", "exec.continue", "exec.pause",      "exec.run_for",      "exec.stepi",
-            "exec.reset", "regs.read", "mem.peek",      "instance.status", "instance.shutdown", "event.stopped",
+            "sh2.master",    "sh2.slave",       "exec.continue",     "exec.pause",    "exec.run_for",
+            "exec.stepi",    "exec.reset",      "regs.read",         "mem.peek",      "video.frame_hash",
+            "video.capture", "instance.status", "instance.shutdown", "event.stopped",
         };
         return capabilities;
     }
@@ -118,6 +120,7 @@ DebugService::DebugService(HeadlessConfig config)
 
 DebugService::~DebugService() {
     StopExecutionThread();
+    m_saturn.reset();
 }
 
 bool DebugService::Initialize(std::string &outError) {
@@ -177,6 +180,23 @@ bool DebugService::Initialize(std::string &outError) {
             m_saturn->LoadDisc(std::move(disc));
         }
 
+        m_videoPixels.resize(static_cast<size_t>(vdp::kMaxResH) * vdp::kMaxResV);
+        auto *videoRenderer = m_saturn->VDP.UseSoftwareRenderer();
+        if (videoRenderer == nullptr) {
+            outError = "failed to initialize the software video renderer";
+            return false;
+        }
+        videoRenderer->EnableThreadedVDP1(false);
+        videoRenderer->EnableThreadedVDP2(false);
+        videoRenderer->EnableThreadedDeinterlacer(false);
+        m_saturn->VDP.SetSoftwareRenderCallback({
+            this,
+            [](uint32 *framebuffer, uint32 width, uint32 height, void *context) {
+                static_cast<DebugService *>(context)->CaptureVideoFrame(framebuffer, width, height);
+            },
+        });
+
+        ClearVideoFrame();
         m_saturn->Reset(true);
         m_slaveTargetEnabled.store(IsTargetEnabled(DebugTarget::Sh2Slave), std::memory_order_release);
         m_state.store(ExecutionState::Paused, std::memory_order_release);
@@ -232,6 +252,42 @@ std::vector<nlohmann::json> DebugService::TakePendingNotifications() {
     std::vector<nlohmann::json> notifications;
     notifications.swap(m_pendingNotifications);
     return notifications;
+}
+
+void DebugService::CaptureVideoFrame(const uint32_t *framebuffer, uint32_t width, uint32_t height) {
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    if (framebuffer == nullptr || width == 0 || height == 0 || pixelCount > m_videoPixels.size()) {
+        return;
+    }
+
+    std::lock_guard lock{m_videoMutex};
+    std::copy_n(framebuffer, pixelCount, m_videoPixels.begin());
+    m_videoWidth = width;
+    m_videoHeight = height;
+    ++m_videoFrameSequence;
+    m_hasVideoFrame = true;
+}
+
+void DebugService::ClearVideoFrame() {
+    std::lock_guard lock{m_videoMutex};
+    m_videoWidth = 0;
+    m_videoHeight = 0;
+    m_hasVideoFrame = false;
+}
+
+std::optional<CapturedVideoFrame> DebugService::SnapshotVideoFrame() {
+    std::lock_guard lock{m_videoMutex};
+    if (!m_hasVideoFrame) {
+        return std::nullopt;
+    }
+
+    CapturedVideoFrame frame;
+    frame.width = m_videoWidth;
+    frame.height = m_videoHeight;
+    frame.sequence = m_videoFrameSequence;
+    const size_t pixelCount = static_cast<size_t>(frame.width) * frame.height;
+    frame.xbgr8888Pixels.assign(m_videoPixels.begin(), m_videoPixels.begin() + pixelCount);
+    return frame;
 }
 
 nlohmann::json DebugService::CreateDebugError(const JsonRpcRequest &request, JsonRpcError rpcError,
@@ -344,6 +400,26 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
             return serverError(ErrorCode::InvalidState, "operation requires a paused instance");
         }
         return std::nullopt;
+    };
+    const auto captureVideo = [&](bool includeImage) {
+        const auto frame = SnapshotVideoFrame();
+        if (!frame) {
+            return serverError(ErrorCode::NoFrame, "no completed video frame is available");
+        }
+
+        const auto rgba8888 = ConvertToRGBA8888(*frame);
+        nlohmann::json result{
+            {"sequence", frame->sequence}, {"width", frame->width},        {"height", frame->height},
+            {"pixel_format", "rgba8888"},  {"hash_algorithm", "xxh3-128"}, {"hash", HashRGBA8888(rgba8888)},
+        };
+        if (includeImage) {
+            const auto png = EncodePNG(rgba8888, frame->width, frame->height);
+            result["mime_type"] = "image/png";
+            result["encoding"] = "base64";
+            result["byte_count"] = png.size();
+            result["data"] = EncodeBase64(png);
+        }
+        return success(std::move(result));
     };
 
     if (request.method == ToString(CommandMethod::DebugVersion)) {
@@ -462,9 +538,30 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
         if (auto error = requirePaused()) {
             return *error;
         }
+        ClearVideoFrame();
         m_saturn->Reset(true);
         m_slaveTargetEnabled.store(m_config.slave_enabled && m_saturn->slaveSH2Enabled, std::memory_order_release);
         return success({{"state", ToString(GetState())}});
+    }
+
+    if (request.method == ToString(CommandMethod::VideoFrameHash)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "video.frame_hash takes no parameters");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        return captureVideo(false);
+    }
+
+    if (request.method == ToString(CommandMethod::VideoCapture)) {
+        if (!HasNoParams(request.params)) {
+            return invalidParams(ErrorCode::InvalidParams, "video.capture takes no parameters");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        return captureVideo(true);
     }
 
     if (request.method == ToString(CommandMethod::ExecStepI)) {

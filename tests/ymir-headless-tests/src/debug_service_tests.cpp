@@ -72,11 +72,11 @@ TEST_CASE("DebugService reports the implemented protocol surface", "[debug-servi
     REQUIRE(response.has_value());
     CHECK((*response)["id"] == 7);
     CHECK((*response)["result"]["protocol"] == "ymir-debug");
-    CHECK((*response)["result"]["protocol_version"] == "0.2.0");
+    CHECK((*response)["result"]["protocol_version"] == "0.3.0");
     CHECK((*response)["result"]["capabilities"] ==
           nlohmann::json{"sh2.master", "sh2.slave", "exec.continue", "exec.pause", "exec.run_for", "exec.stepi",
-                         "exec.reset", "regs.read", "mem.peek", "instance.status", "instance.shutdown",
-                         "event.stopped"});
+                         "exec.reset", "regs.read", "mem.peek", "video.frame_hash", "video.capture", "instance.status",
+                         "instance.shutdown", "event.stopped"});
 
     const auto notification = service.HandleLine(R"({"jsonrpc":"2.0","method":"debug.version"})");
     CHECK_FALSE(notification.has_value());
@@ -105,6 +105,10 @@ TEST_CASE("DebugService loads an IPL and exposes paused SH-2 state", "[debug-ser
     CHECK(ready["params"]["targets"][0]["enabled"] == true);
     CHECK(ready["params"]["targets"][1]["enabled"] == false);
 
+    const auto noFrame = service.HandleLine(R"({"jsonrpc":"2.0","method":"video.frame_hash","id":"no-frame"})");
+    REQUIRE(noFrame.has_value());
+    CHECK((*noFrame)["error"]["data"]["debug_code"] == "no_frame");
+
     const auto registers =
         service.HandleLine(R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":"regs"})");
     REQUIRE(registers.has_value());
@@ -132,6 +136,23 @@ TEST_CASE("DebugService loads an IPL and exposes paused SH-2 state", "[debug-ser
     CHECK((*runFor)["result"]["reason"] == "frame_limit");
     CHECK((*runFor)["result"]["frames_advanced"] == 2);
 
+    const auto frameHash = service.HandleLine(R"({"jsonrpc":"2.0","method":"video.frame_hash","id":"frame-hash"})");
+    REQUIRE(frameHash.has_value());
+    CHECK((*frameHash)["result"]["width"].get<uint32_t>() > 0);
+    CHECK((*frameHash)["result"]["height"].get<uint32_t>() > 0);
+    CHECK((*frameHash)["result"]["pixel_format"] == "rgba8888");
+    CHECK((*frameHash)["result"]["hash_algorithm"] == "xxh3-128");
+    CHECK((*frameHash)["result"]["hash"].get<std::string>().size() == 32);
+
+    const auto capture = service.HandleLine(R"({"jsonrpc":"2.0","method":"video.capture","id":"capture"})");
+    REQUIRE(capture.has_value());
+    CHECK((*capture)["result"]["sequence"] == (*frameHash)["result"]["sequence"]);
+    CHECK((*capture)["result"]["hash"] == (*frameHash)["result"]["hash"]);
+    CHECK((*capture)["result"]["mime_type"] == "image/png");
+    CHECK((*capture)["result"]["encoding"] == "base64");
+    CHECK((*capture)["result"]["byte_count"].get<size_t>() > 8);
+    CHECK((*capture)["result"]["data"].get<std::string>().starts_with("iVBORw0KGgo"));
+
     auto notifications = service.TakePendingNotifications();
     REQUIRE(notifications.size() == 1);
     CHECK(notifications[0]["method"] == "instance.stopped");
@@ -155,6 +176,11 @@ TEST_CASE("DebugService loads an IPL and exposes paused SH-2 state", "[debug-ser
         service.HandleLine(R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":"busy"})");
     REQUIRE(readWhileRunning.has_value());
     CHECK((*readWhileRunning)["error"]["data"]["debug_code"] == "invalid_state");
+
+    const auto captureWhileRunning =
+        service.HandleLine(R"({"jsonrpc":"2.0","method":"video.capture","id":"capture-busy"})");
+    REQUIRE(captureWhileRunning.has_value());
+    CHECK((*captureWhileRunning)["error"]["data"]["debug_code"] == "invalid_state");
 
     const auto pause = service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.pause","id":"pause"})");
     REQUIRE(pause.has_value());
@@ -185,6 +211,27 @@ TEST_CASE("DebugService loads an IPL and exposes paused SH-2 state", "[debug-ser
     CHECK(service.ShutdownRequested());
 }
 
+TEST_CASE("DebugService invalidates captured frames on reset", "[debug-service][video]") {
+    const auto ipl = CreateZeroIPL();
+    ymir::debug::HeadlessConfig config;
+    config.ipl_path = ipl.path;
+    ymir::debug::DebugService service{config};
+
+    std::string error;
+    REQUIRE(service.Initialize(error));
+    const auto runFor = service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.run_for","params":{"frames":1},"id":1})");
+    REQUIRE(runFor.has_value());
+    const auto captured = service.HandleLine(R"({"jsonrpc":"2.0","method":"video.frame_hash","id":2})");
+    REQUIRE(captured.has_value());
+    REQUIRE((*captured).contains("result"));
+
+    const auto reset = service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.reset","id":3})");
+    REQUIRE(reset.has_value());
+    const auto staleFrame = service.HandleLine(R"({"jsonrpc":"2.0","method":"video.frame_hash","id":4})");
+    REQUIRE(staleFrame.has_value());
+    CHECK((*staleFrame)["error"]["data"]["debug_code"] == "no_frame");
+}
+
 TEST_CASE("ymir-headless reserves stdout for JSON-RPC", "[debug-service][process]") {
     const auto ipl = CreateZeroIPL();
     const auto requests = CreateTempFile("requests");
@@ -197,10 +244,12 @@ TEST_CASE("ymir-headless reserves stdout for JSON-RPC", "[debug-service][process
         output << R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":2})" << '\n';
         output << R"({"jsonrpc":"2.0","method":"exec.stepi","params":{"target":"sh2.master"},"id":3})" << '\n';
         output << R"({"jsonrpc":"2.0","method":"exec.run_for","params":{"frames":1},"id":4})" << '\n';
-        output << R"({"jsonrpc":"2.0","method":"exec.continue","id":5})" << '\n';
-        output << R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":6})" << '\n';
-        output << R"({"jsonrpc":"2.0","method":"exec.pause","id":7})" << '\n';
-        output << R"({"jsonrpc":"2.0","method":"instance.shutdown","id":8})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"video.frame_hash","id":5})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"video.capture","id":6})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"exec.continue","id":7})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"regs.read","params":{"target":"sh2.master"},"id":8})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"exec.pause","id":9})" << '\n';
+        output << R"({"jsonrpc":"2.0","method":"instance.shutdown","id":10})" << '\n';
     }
 
     const std::filesystem::path executable{YMIR_HEADLESS_TEST_BINARY};
@@ -220,7 +269,7 @@ TEST_CASE("ymir-headless reserves stdout for JSON-RPC", "[debug-service][process
         REQUIRE_NOTHROW(messages.push_back(nlohmann::json::parse(line)));
     }
 
-    REQUIRE(messages.size() == 11);
+    REQUIRE(messages.size() == 13);
     CHECK(messages[0]["method"] == "instance.ready");
 
     std::vector<int> responseIds;
@@ -233,11 +282,13 @@ TEST_CASE("ymir-headless reserves stdout for JSON-RPC", "[debug-service][process
             stopReasons.push_back(message["params"]["reason"].get<std::string>());
         }
     }
-    CHECK(responseIds == std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8});
+    CHECK(responseIds == std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
     CHECK(stopReasons == std::vector<std::string>{"frame_limit", "pause"});
     CHECK(messages[4]["id"] == 4);
     CHECK(messages[5]["method"] == "instance.stopped");
-    CHECK(messages[9]["method"] == "instance.stopped");
+    CHECK(messages[6]["result"]["hash_algorithm"] == "xxh3-128");
+    CHECK(messages[7]["result"]["data"].get<std::string>().starts_with("iVBORw0KGgo"));
+    CHECK(messages[11]["method"] == "instance.stopped");
 
     std::ifstream diagnostics{diagnosticOutput.path};
     const std::string diagnosticText{std::istreambuf_iterator<char>{diagnostics}, {}};

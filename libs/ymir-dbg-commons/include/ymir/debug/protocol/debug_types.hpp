@@ -79,6 +79,7 @@ enum class ErrorCode {
     BreakpointNotFound,
     InvalidMemorySpace,
     MemoryOutOfRange,
+    NoFrame,
     Unsupported,
     InternalError,
 };
@@ -97,6 +98,7 @@ constexpr std::string_view ToString(ErrorCode e) {
     case ErrorCode::BreakpointNotFound: return "breakpoint_not_found";
     case ErrorCode::InvalidMemorySpace: return "invalid_memory_space";
     case ErrorCode::MemoryOutOfRange: return "memory_out_of_range";
+    case ErrorCode::NoFrame: return "no_frame";
     case ErrorCode::Unsupported: return "unsupported";
     case ErrorCode::InternalError: return "internal_error";
     }

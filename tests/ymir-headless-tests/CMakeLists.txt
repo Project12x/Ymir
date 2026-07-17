@@ -4,6 +4,7 @@ add_executable(ymir-headless-tests
     src/debug_service_tests.cpp
     src/smoke_tests.cpp
     src/protocol_tests.cpp
+    src/video_capture_tests.cpp
 )
 add_executable(ymir::ymir-headless-tests ALIAS ymir-headless-tests)
 set_target_properties(ymir-headless-tests PROPERTIES

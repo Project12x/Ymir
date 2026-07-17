@@ -1,14 +1,17 @@
 find_package(tomlplusplus CONFIG REQUIRED)
+find_package(Stb REQUIRED)
 
 ## Create the emulator-backed debug service shared by the worker and its tests
 add_library(ymir-headless-service STATIC
     src/debug_service.cpp
     src/toml_implementation.cpp
+    src/video_capture.cpp
 )
 add_library(ymir::ymir-headless-service ALIAS ymir-headless-service)
 
 target_include_directories(ymir-headless-service
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
+    PRIVATE "$<BUILD_INTERFACE:${Stb_INCLUDE_DIR}>"
 )
 target_compile_features(ymir-headless-service PUBLIC cxx_std_20)
 target_link_libraries(ymir-headless-service PUBLIC

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "video_capture.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -68,6 +69,9 @@ private:
     void StopExecutionThread();
     void ExecutionThreadMain();
     void QueueStoppedNotificationLocked(StopReason reason);
+    void CaptureVideoFrame(const uint32_t *framebuffer, uint32_t width, uint32_t height);
+    void ClearVideoFrame();
+    [[nodiscard]] std::optional<CapturedVideoFrame> SnapshotVideoFrame();
 
     HeadlessConfig m_config;
     std::unique_ptr<ymir::Saturn> m_saturn;
@@ -85,6 +89,13 @@ private:
     bool m_pauseRequested{};
     uint32_t m_stopSequence{};
     std::vector<nlohmann::json> m_pendingNotifications;
+
+    std::mutex m_videoMutex;
+    std::vector<uint32_t> m_videoPixels;
+    uint32_t m_videoWidth{};
+    uint32_t m_videoHeight{};
+    uint64_t m_videoFrameSequence{};
+    bool m_hasVideoFrame{};
 };
 
 } // namespace ymir::debug

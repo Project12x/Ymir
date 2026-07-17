@@ -17,7 +17,7 @@
 
 TEST_CASE("Protocol version constants", "[protocol]") {
     CHECK(ymir::debug::kProtocolName == "ymir-debug");
-    CHECK(ymir::debug::kProtocolVersion == "0.2.0");
+    CHECK(ymir::debug::kProtocolVersion == "0.3.0");
     CHECK(ymir::debug::kStdioJsonRpcLinesTransport == "stdio-jsonrpc-lines");
 }
 
@@ -46,6 +46,7 @@ TEST_CASE("ErrorCode string round-trip", "[protocol]") {
     CHECK(ToString(ymir::debug::ErrorCode::InvalidState) == "invalid_state");
     CHECK(ToString(ymir::debug::ErrorCode::TargetDisabled) == "target_disabled");
     CHECK(ToString(ymir::debug::ErrorCode::InvalidAddress) == "invalid_address");
+    CHECK(ToString(ymir::debug::ErrorCode::NoFrame) == "no_frame");
 }
 
 TEST_CASE("CommandMethod string round-trip", "[protocol]") {
@@ -55,6 +56,8 @@ TEST_CASE("CommandMethod string round-trip", "[protocol]") {
     CHECK(ToString(ymir::debug::CommandMethod::ExecContinue) == "exec.continue");
     CHECK(ToString(ymir::debug::CommandMethod::ExecPause) == "exec.pause");
     CHECK(ToString(ymir::debug::CommandMethod::ExecRunFor) == "exec.run_for");
+    CHECK(ToString(ymir::debug::CommandMethod::VideoFrameHash) == "video.frame_hash");
+    CHECK(ToString(ymir::debug::CommandMethod::VideoCapture) == "video.capture");
     CHECK(ToString(ymir::debug::CommandMethod::ExecStepI) == "exec.stepi");
     CHECK(ToString(ymir::debug::CommandMethod::BreakpointSet) == "breakpoint.set");
 }
