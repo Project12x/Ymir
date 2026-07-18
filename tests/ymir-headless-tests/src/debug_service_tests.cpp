@@ -75,8 +75,8 @@ TEST_CASE("DebugService reports the implemented protocol surface", "[debug-servi
     CHECK((*response)["result"]["protocol_version"] == "0.3.0");
     CHECK((*response)["result"]["capabilities"] ==
           nlohmann::json{"sh2.master", "sh2.slave", "exec.continue", "exec.pause", "exec.run_for", "exec.stepi",
-                         "exec.reset", "regs.read", "mem.peek", "video.frame_hash", "video.capture", "instance.status",
-                         "instance.shutdown", "event.stopped"});
+                         "exec.reset", "regs.read", "mem.peek", "mem.poke", "input.pulse", "video.frame_hash",
+                         "video.capture", "instance.status", "instance.shutdown", "event.stopped"});
 
     const auto notification = service.HandleLine(R"({"jsonrpc":"2.0","method":"debug.version"})");
     CHECK_FALSE(notification.has_value());

@@ -16,6 +16,7 @@
 #include <initializer_list>
 #include <limits>
 #include <span>
+#include <thread>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -516,6 +517,12 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
         try {
             for (; framesAdvanced < *frames; ++framesAdvanced) {
                 m_saturn->RunFrame();
+                // exec.run_for is deliberately synchronous for deterministic
+                // debugging, but CD-block host I/O is serviced by another
+                // host thread. Yield after a completed frame so a long bounded
+                // run does not starve that worker and stall the BIOS handoff.
+                // This affects host scheduling only, never emulated cycles.
+                std::this_thread::yield();
             }
             m_slaveTargetEnabled.store(m_config.slave_enabled && m_saturn->slaveSH2Enabled, std::memory_order_release);
             m_state.store(ExecutionState::Paused, std::memory_order_release);
