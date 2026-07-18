@@ -22,6 +22,7 @@ enum class CommandMethod {
     RegsRead,
     MemPeek,
     MemPoke,
+    InputPulse,
     VideoFrameHash,
     VideoCapture,
     DisasmAt,
@@ -44,6 +45,7 @@ constexpr std::string_view ToString(CommandMethod m) {
     case CommandMethod::RegsRead: return "regs.read";
     case CommandMethod::MemPeek: return "mem.peek";
     case CommandMethod::MemPoke: return "mem.poke";
+    case CommandMethod::InputPulse: return "input.pulse";
     case CommandMethod::VideoFrameHash: return "video.frame_hash";
     case CommandMethod::VideoCapture: return "video.capture";
     case CommandMethod::DisasmAt: return "disasm.at";

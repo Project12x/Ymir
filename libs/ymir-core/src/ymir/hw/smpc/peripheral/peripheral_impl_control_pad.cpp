@@ -7,10 +7,19 @@ namespace ymir::peripheral {
 ControlPad::ControlPad(CBPeripheralReport callback)
     : BasePeripheral(PeripheralType::ControlPad, 0x0, callback) {}
 
+void ControlPad::SetButtons(Button buttons) {
+    m_forcedButtons = buttons;
+    m_forceButtons = true;
+}
+
 void ControlPad::UpdateInputs() {
     PeripheralReport report{.type = PeripheralType::ControlPad, .report = {.controlPad = {.buttons = Button::Default}}};
     m_cbPeripheralReport(report);
     m_report = report.report.controlPad;
+    if (m_forceButtons) {
+        m_report.buttons = m_forcedButtons;
+        m_forceButtons = false;
+    }
     m_report.buttons &= Button::All;
     m_report.buttons |= static_cast<Button>(0b111);
 }

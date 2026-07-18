@@ -5,6 +5,7 @@
 #include <ymir/debug/protocol/debug_command.hpp>
 #include <ymir/debug/protocol/protocol_version.hpp>
 #include <ymir/hw/vdp/vdp2_defs.hpp>
+#include <ymir/hw/smpc/peripheral/peripheral_impl_control_pad.hpp>
 #include <ymir/media/loader/loader.hpp>
 #include <ymir/version.hpp>
 
@@ -29,7 +30,7 @@ namespace {
     const std::vector<std::string> &Capabilities() {
         static const std::vector<std::string> capabilities{
             "sh2.master",    "sh2.slave",       "exec.continue",     "exec.pause",    "exec.run_for",
-            "exec.stepi",    "exec.reset",      "regs.read",         "mem.peek",      "mem.poke",
+            "exec.stepi",    "exec.reset",      "regs.read",         "mem.peek",      "mem.poke", "input.pulse",
             "video.frame_hash",
             "video.capture", "instance.status", "instance.shutdown", "event.stopped",
         };
@@ -152,6 +153,9 @@ bool DebugService::Initialize(std::string &outError) {
             return false;
         }
         m_saturn->LoadIPL(std::span<uint8_t, ymir::sys::kIPLSize>{ipl.data(), ipl.size()});
+        // Headless automation needs a deterministic standard pad for BIOS
+        // first-boot prompts and later game input pulses.
+        m_saturn->SMPC.GetPeripheralPort1().ConnectControlPad();
 
         if (m_config.bram_path) {
             std::error_code error;
@@ -718,6 +722,30 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
             {"address", *address},
             {"bytes_written", offset},
         });
+    }
+
+    if (request.method == ToString(CommandMethod::InputPulse)) {
+        if (!HasOnlyKeys(request.params, {"port", "buttons"}) || !request.params.contains("buttons")) {
+            return invalidParams(ErrorCode::InvalidParams, "input.pulse expects buttons and optional port");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        if (request.params.contains("port") &&
+            (!request.params["port"].is_string() || request.params["port"].get<std::string>() != "port1")) {
+            return invalidParams(ErrorCode::InvalidParams, "only port1 is supported");
+        }
+        const auto buttons = ParseUint32(request.params["buttons"]);
+        if (!buttons || (*buttons & ~0xFFF8U) != 0U) {
+            return invalidParams(ErrorCode::InvalidParams, "buttons must be a Saturn Button bitmask");
+        }
+        auto *pad = dynamic_cast<ymir::peripheral::ControlPad *>(
+            &m_saturn->SMPC.GetPeripheralPort1().GetPeripheral());
+        if (pad == nullptr) {
+            return serverError(ErrorCode::InvalidState, "port1 is not connected to a control pad");
+        }
+        pad->SetButtons(static_cast<ymir::peripheral::Button>(*buttons));
+        return success({{"port", "port1"}, {"buttons", *buttons}, {"state", ToString(GetState())}});
     }
 
     return JsonRpcAdapter::CreateMethodNotFoundResponse(request.id, request.method);

@@ -39,6 +39,7 @@ The worker starts paused and emits `instance.ready`. Protocol version 0.3.0 impl
 - `regs.read`
 - `mem.peek`
 - `mem.poke`
+- `input.pulse`
 - `video.frame_hash`
 - `video.capture`
 
@@ -51,6 +52,12 @@ behavior.
 target, address, and 1–65536 byte `data` array, bypasses the emulated cache,
 and returns the byte count written. It is unavailable while the instance is
 running; clients should record every write in their evidence report.
+
+`input.pulse` injects a one-frame standard-control-pad state on `port1` while
+the instance is paused. Its `buttons` value is the Saturn `Button` bitmask
+(for example, `0x0400` for A and `0x4000` for Right). The headless service
+connects a deterministic pad during initialization so BIOS prompts can be
+automated without SDL input.
 
 `exec.continue` transfers Saturn ownership to one execution thread. Core inspection commands remain rejected with
 `invalid_state` until `exec.pause` has waited for `RunFrame()` to return and the instance is actually quiescent. The
