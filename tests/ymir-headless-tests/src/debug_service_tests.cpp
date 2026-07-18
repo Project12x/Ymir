@@ -72,7 +72,7 @@ TEST_CASE("DebugService reports the implemented protocol surface", "[debug-servi
     REQUIRE(response.has_value());
     CHECK((*response)["id"] == 7);
     CHECK((*response)["result"]["protocol"] == "ymir-debug");
-    CHECK((*response)["result"]["protocol_version"] == "0.3.0");
+    CHECK((*response)["result"]["protocol_version"] == "0.3.1");
     CHECK((*response)["result"]["capabilities"] ==
           nlohmann::json{"sh2.master", "sh2.slave", "exec.continue", "exec.pause", "exec.run_for", "exec.stepi",
                          "exec.reset", "regs.read", "mem.peek", "mem.poke", "input.pulse", "video.frame_hash",
@@ -121,6 +121,25 @@ TEST_CASE("DebugService loads an IPL and exposes paused SH-2 state", "[debug-ser
     REQUIRE(memory.has_value());
     CHECK((*memory)["result"]["address"] == 0);
     CHECK((*memory)["result"]["data"] == nlohmann::json{0, 0, 0, 0});
+
+    const auto input = service.HandleLine(
+        R"({"jsonrpc":"2.0","method":"input.pulse","params":{"port":"port1","buttons":"0x7ff8","frames":8},"id":"input"})");
+    REQUIRE(input.has_value());
+    CHECK((*input)["result"]["buttons"] == 0x7FF8);
+    CHECK((*input)["result"]["frames"] == 8);
+
+    const auto inputDefaultFrames = service.HandleLine(
+        R"({"jsonrpc":"2.0","method":"input.pulse","params":{"buttons":"0xfbf8"},"id":"input-default"})");
+    REQUIRE(inputDefaultFrames.has_value());
+    CHECK((*inputDefaultFrames)["result"]["frames"] == 1);
+
+    for (const auto invalidFrames : {0, 121}) {
+        const auto invalidInput = service.HandleLine(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"input.pulse\",\"params\":{\"buttons\":65528,\"frames\":" +
+            std::to_string(invalidFrames) + "},\"id\":\"invalid-input\"}");
+        REQUIRE(invalidInput.has_value());
+        CHECK((*invalidInput)["error"]["data"]["debug_code"] == "invalid_params");
+    }
 
     const auto step =
         service.HandleLine(R"({"jsonrpc":"2.0","method":"exec.stepi","params":{"target":"sh2.master"},"id":"step"})");

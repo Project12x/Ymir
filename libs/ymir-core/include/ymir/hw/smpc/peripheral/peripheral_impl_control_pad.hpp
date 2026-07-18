@@ -16,6 +16,10 @@ public:
     /// Inject a button state for the next peripheral report.
     void SetButtons(Button buttons);
 
+    /// Override every peripheral report until ClearPersistentButtons().
+    void SetPersistentButtons(Button buttons);
+    void ClearPersistentButtons();
+
     void UpdateInputs() override;
 
     [[nodiscard]] uint8 GetReportLength() const override;
@@ -28,6 +32,8 @@ private:
     ControlPadReport m_report;
     Button m_forcedButtons{Button::Default};
     bool m_forceButtons{false};
+    Button m_persistentButtons{Button::Default};
+    bool m_persistButtons{false};
 };
 
 } // namespace ymir::peripheral

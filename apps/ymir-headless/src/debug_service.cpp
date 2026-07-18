@@ -27,6 +27,7 @@ namespace {
 
     constexpr uint32_t kMaxPeekBytes = 64_KiB;
     constexpr uint32_t kMaxRunForFrames = 3600;
+    constexpr uint32_t kMaxInputPulseFrames = 120;
 
     const std::vector<std::string> &Capabilities() {
         static const std::vector<std::string> capabilities{
@@ -346,6 +347,34 @@ void DebugService::QueueStoppedNotificationLocked(StopReason reason) {
                                                                }));
 }
 
+void DebugService::ApplyPendingInputFrame() {
+    auto *pad = dynamic_cast<ymir::peripheral::ControlPad *>(
+        &m_saturn->SMPC.GetPeripheralPort1().GetPeripheral());
+    if (pad == nullptr) {
+        ClearPendingInput();
+        return;
+    }
+
+    if (m_inputFramesRemaining > 0) {
+        --m_inputFramesRemaining;
+        m_inputReleasePending = true;
+    } else if (m_inputReleasePending) {
+        pad->ClearPersistentButtons();
+        m_inputReleasePending = false;
+    }
+}
+
+void DebugService::ClearPendingInput() {
+    auto *pad = dynamic_cast<ymir::peripheral::ControlPad *>(
+        &m_saturn->SMPC.GetPeripheralPort1().GetPeripheral());
+    if (pad != nullptr) {
+        pad->ClearPersistentButtons();
+    }
+    m_inputButtons = static_cast<uint16_t>(ymir::peripheral::Button::Default);
+    m_inputFramesRemaining = 0;
+    m_inputReleasePending = false;
+}
+
 void DebugService::ExecutionThreadMain() {
     for (;;) {
         std::unique_lock lock{m_executionMutex};
@@ -366,6 +395,7 @@ void DebugService::ExecutionThreadMain() {
 
         lock.unlock();
         try {
+            ApplyPendingInputFrame();
             m_saturn->RunFrame();
             m_slaveTargetEnabled.store(m_config.slave_enabled && m_saturn->slaveSH2Enabled, std::memory_order_release);
         } catch (...) {
@@ -516,6 +546,7 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
         m_state.store(ExecutionState::Running, std::memory_order_release);
         try {
             for (; framesAdvanced < *frames; ++framesAdvanced) {
+                ApplyPendingInputFrame();
                 m_saturn->RunFrame();
                 // exec.run_for is deliberately synchronous for deterministic
                 // debugging, but CD-block host I/O is serviced by another
@@ -551,6 +582,7 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
             return *error;
         }
         ClearVideoFrame();
+        ClearPendingInput();
         m_saturn->Reset(true);
         m_slaveTargetEnabled.store(m_config.slave_enabled && m_saturn->slaveSH2Enabled, std::memory_order_release);
         return success({{"state", ToString(GetState())}});
@@ -732,8 +764,8 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
     }
 
     if (request.method == ToString(CommandMethod::InputPulse)) {
-        if (!HasOnlyKeys(request.params, {"port", "buttons"}) || !request.params.contains("buttons")) {
-            return invalidParams(ErrorCode::InvalidParams, "input.pulse expects buttons and optional port");
+        if (!HasOnlyKeys(request.params, {"port", "buttons", "frames"}) || !request.params.contains("buttons")) {
+            return invalidParams(ErrorCode::InvalidParams, "input.pulse expects buttons and optional port and frames");
         }
         if (auto error = requirePaused()) {
             return *error;
@@ -744,15 +776,27 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
         }
         const auto buttons = ParseUint32(request.params["buttons"]);
         if (!buttons || (*buttons & ~0xFFF8U) != 0U) {
-            return invalidParams(ErrorCode::InvalidParams, "buttons must be a Saturn Button bitmask");
+            return invalidParams(ErrorCode::InvalidParams, "buttons must be an active-low Saturn control-pad report");
+        }
+        uint32_t frames = 1;
+        if (request.params.contains("frames")) {
+            const auto parsedFrames = ParseUint32(request.params["frames"]);
+            if (!parsedFrames || *parsedFrames == 0 || *parsedFrames > kMaxInputPulseFrames) {
+                return invalidParams(ErrorCode::InvalidParams, "frames must be between 1 and 120");
+            }
+            frames = *parsedFrames;
         }
         auto *pad = dynamic_cast<ymir::peripheral::ControlPad *>(
             &m_saturn->SMPC.GetPeripheralPort1().GetPeripheral());
         if (pad == nullptr) {
             return serverError(ErrorCode::InvalidState, "port1 is not connected to a control pad");
         }
-        pad->SetButtons(static_cast<ymir::peripheral::Button>(*buttons));
-        return success({{"port", "port1"}, {"buttons", *buttons}, {"state", ToString(GetState())}});
+        m_inputButtons = static_cast<uint16_t>(*buttons);
+        m_inputFramesRemaining = frames;
+        m_inputReleasePending = false;
+        pad->SetPersistentButtons(static_cast<ymir::peripheral::Button>(*buttons));
+        return success(
+            {{"port", "port1"}, {"buttons", *buttons}, {"frames", frames}, {"state", ToString(GetState())}});
     }
 
     return JsonRpcAdapter::CreateMethodNotFoundResponse(request.id, request.method);

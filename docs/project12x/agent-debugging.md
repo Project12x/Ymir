@@ -26,7 +26,7 @@ program, preserve its MIT copyright and permission notice.
 
 ## Implemented protocol slice
 
-The worker starts paused and emits `instance.ready`. Protocol version 0.3.0 implements:
+The worker starts paused and emits `instance.ready`. Protocol version 0.3.1 implements:
 
 - `debug.version`
 - `instance.status`
@@ -53,11 +53,16 @@ target, address, and 1–65536 byte `data` array, bypasses the emulated cache,
 and returns the byte count written. It is unavailable while the instance is
 running; clients should record every write in their evidence report.
 
-`input.pulse` injects a one-frame standard-control-pad state on `port1` while
-the instance is paused. Its `buttons` value is the Saturn `Button` bitmask
-(for example, `0x0400` for A and `0x4000` for Right). The headless service
-connects a deterministic pad during initialization so BIOS prompts can be
-automated without SDL input.
+`input.pulse` schedules a standard-control-pad state on `port1` while the
+instance is paused. `buttons` is the active-low two-byte Saturn pad report:
+clear `0x0400` for A or `0x8000` for Right (for example, Right alone is
+`0x7FF8`). The optional `frames` field holds that report for 1–120 emulated
+frames and defaults to one. The service keeps the state active for every SMPC
+peripheral report across those frames, then removes the override, so multiple
+asynchronous collections in one frame cannot consume a deliberate press before
+the program's transaction observes it. The
+headless service connects a deterministic pad during initialization so BIOS
+prompts can be automated without SDL input.
 
 `exec.continue` transfers Saturn ownership to one execution thread. Core inspection commands remain rejected with
 `invalid_state` until `exec.pause` has waited for `RunFrame()` to return and the instance is actually quiescent. The

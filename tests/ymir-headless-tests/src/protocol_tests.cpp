@@ -17,7 +17,7 @@
 
 TEST_CASE("Protocol version constants", "[protocol]") {
     CHECK(ymir::debug::kProtocolName == "ymir-debug");
-    CHECK(ymir::debug::kProtocolVersion == "0.3.0");
+    CHECK(ymir::debug::kProtocolVersion == "0.3.1");
     CHECK(ymir::debug::kStdioJsonRpcLinesTransport == "stdio-jsonrpc-lines");
 }
 

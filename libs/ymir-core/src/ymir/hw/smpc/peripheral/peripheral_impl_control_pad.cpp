@@ -12,11 +12,22 @@ void ControlPad::SetButtons(Button buttons) {
     m_forceButtons = true;
 }
 
+void ControlPad::SetPersistentButtons(Button buttons) {
+    m_persistentButtons = buttons;
+    m_persistButtons = true;
+}
+
+void ControlPad::ClearPersistentButtons() {
+    m_persistButtons = false;
+}
+
 void ControlPad::UpdateInputs() {
     PeripheralReport report{.type = PeripheralType::ControlPad, .report = {.controlPad = {.buttons = Button::Default}}};
     m_cbPeripheralReport(report);
     m_report = report.report.controlPad;
-    if (m_forceButtons) {
+    if (m_persistButtons) {
+        m_report.buttons = m_persistentButtons;
+    } else if (m_forceButtons) {
         m_report.buttons = m_forcedButtons;
         m_forceButtons = false;
     }

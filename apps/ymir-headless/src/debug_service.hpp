@@ -68,6 +68,8 @@ private:
     void StartExecutionThread();
     void StopExecutionThread();
     void ExecutionThreadMain();
+    void ApplyPendingInputFrame();
+    void ClearPendingInput();
     void QueueStoppedNotificationLocked(StopReason reason);
     void CaptureVideoFrame(const uint32_t *framebuffer, uint32_t width, uint32_t height);
     void ClearVideoFrame();
@@ -87,6 +89,9 @@ private:
     bool m_workerStopRequested{};
     bool m_continueRequested{};
     bool m_pauseRequested{};
+    uint16_t m_inputButtons{0xFFF8U};
+    uint32_t m_inputFramesRemaining{};
+    bool m_inputReleasePending{};
     uint32_t m_stopSequence{};
     std::vector<nlohmann::json> m_pendingNotifications;
 
