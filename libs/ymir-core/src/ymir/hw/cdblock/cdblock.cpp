@@ -1719,8 +1719,8 @@ FORCE_INLINE void CDBlock::ProcessCommand() {
     case 0x62: CmdDeleteSectorData(); break;
     case 0x63: CmdGetThenDeleteSectorData(); break;
     case 0x64: CmdPutSectorData(); break;
-    // case 0x65: CmdCopySectorData(); break;
-    // case 0x66: CmdMoveSectorData(); break;
+    case 0x65: CmdCopySectorData(); break;
+    case 0x66: CmdMoveSectorData(); break;
     case 0x67: CmdGetCopyError(); break;
     case 0x70: CmdChangeDirectory(); break;
     case 0x71: CmdReadDirectory(); break;
@@ -3028,14 +3028,37 @@ void CDBlock::CmdCopySectorData() {
     // const uint8 srcPartitionNumber = bit::extract<8, 15>(m_CR[2]);
     // const uint16 sectorNumber = m_CR[3];
 
-    // TODO: setup async sector copy transfer
-    // TODO: report Reject status if not enough buffer space available
-    devlog::info<grp::base>("Copy sector data command is unimplemented");
-    YMIR_DEV_CHECK();
+    const uint8 dstFilterNumber = bit::extract<0, 7>(m_CR[0]);
+    const uint16 sectorOffset = m_CR[1];
+    const uint8 srcPartitionNumber = bit::extract<8, 15>(m_CR[2]);
+    const uint16 sectorNumber = m_CR[3];
 
-    // Output structure: standard CD status data
-    ReportCDStatus();
+    devlog::debug<grp::cmd>("Copy sectors: filter {:02X}, partition {:02X}, offset {:04X}, count {:04X}",
+                             dstFilterNumber, srcPartitionNumber, sectorOffset, sectorNumber);
 
+    const uint32 partitionSize = srcPartitionNumber < kNumPartitions
+                                     ? m_partitionManager.GetBufferCount(srcPartitionNumber)
+                                     : 0;
+    const uint32 startSector = sectorOffset == 0xFFFF ? partitionSize - 1 : sectorOffset;
+    const uint32 endSector = sectorNumber == 0xFFFF ? partitionSize - 1 : startSector + sectorNumber - 1;
+    bool reject = dstFilterNumber >= kNumFilters || srcPartitionNumber >= kNumPartitions ||
+                  sectorNumber == 0 || partitionSize == 0 || startSector >= partitionSize ||
+                  endSector >= partitionSize || startSector > endSector;
+    if (!reject && m_partitionManager.GetFreeBufferCount() < endSector - startSector + 1) {
+        reject = true;
+    }
+
+    if (!reject) {
+        for (uint32 offset = startSector; offset <= endSector; ++offset) {
+            const Buffer *buffer = m_partitionManager.GetTail(srcPartitionNumber, static_cast<uint8>(offset));
+            if (buffer == nullptr || !RouteBufferToFilter(dstFilterNumber, *buffer)) {
+                reject = true;
+                break;
+            }
+        }
+    }
+
+    ReportCDStatus(reject ? kStatusReject : GetStatusCode());
     SetInterrupt(kHIRQ_CMOK | kHIRQ_ECPY);
 }
 
@@ -3052,14 +3075,58 @@ void CDBlock::CmdMoveSectorData() {
     // const uint8 srcPartitionNumber = bit::extract<8, 15>(m_CR[2]);
     // const uint16 sectorNumber = m_CR[3];
 
-    // TODO: setup async sector move transfer
-    devlog::info<grp::base>("Move sector data command is unimplemented");
-    YMIR_DEV_CHECK();
+    const uint8 dstFilterNumber = bit::extract<0, 7>(m_CR[0]);
+    const uint16 sectorOffset = m_CR[1];
+    const uint8 srcPartitionNumber = bit::extract<8, 15>(m_CR[2]);
+    const uint16 sectorNumber = m_CR[3];
 
-    // Output structure: standard CD status data
-    ReportCDStatus();
+    devlog::debug<grp::cmd>("Move sectors: filter {:02X}, partition {:02X}, offset {:04X}, count {:04X}",
+                             dstFilterNumber, srcPartitionNumber, sectorOffset, sectorNumber);
 
+    const uint32 partitionSize = srcPartitionNumber < kNumPartitions
+                                     ? m_partitionManager.GetBufferCount(srcPartitionNumber)
+                                     : 0;
+    const uint32 startSector = sectorOffset == 0xFFFF ? partitionSize - 1 : sectorOffset;
+    const uint32 endSector = sectorNumber == 0xFFFF ? partitionSize - 1 : startSector + sectorNumber - 1;
+    bool reject = dstFilterNumber >= kNumFilters || srcPartitionNumber >= kNumPartitions ||
+                  sectorNumber == 0 || partitionSize == 0 || startSector >= partitionSize ||
+                  endSector >= partitionSize || startSector > endSector;
+    if (!reject && m_partitionManager.GetFreeBufferCount() < endSector - startSector + 1) {
+        reject = true;
+    }
+
+    if (!reject) {
+        for (uint32 offset = startSector; offset <= endSector; ++offset) {
+            const Buffer *buffer = m_partitionManager.GetTail(srcPartitionNumber, static_cast<uint8>(offset));
+            if (buffer == nullptr || !RouteBufferToFilter(dstFilterNumber, *buffer)) {
+                reject = true;
+                break;
+            }
+        }
+        if (!reject) {
+            m_partitionManager.DeleteSectors(srcPartitionNumber, sectorOffset, sectorNumber);
+        }
+    }
+
+    ReportCDStatus(reject ? kStatusReject : GetStatusCode());
     SetInterrupt(kHIRQ_CMOK | kHIRQ_ECPY);
+}
+
+bool CDBlock::RouteBufferToFilter(uint8 filterNumber, const Buffer &buffer) {
+    for (int i = 0; i < kNumFilters && filterNumber != Filter::kDisconnected && filterNumber < kNumFilters; ++i) {
+        const Filter &filter = m_filters[filterNumber];
+        if (filter.Test(buffer)) {
+            if (filter.passOutput == Filter::kDisconnected) {
+                return false;
+            }
+            m_partitionManager.InsertHead(filter.passOutput, buffer);
+            m_lastCDWritePartition = filter.passOutput;
+            SetInterrupt(kHIRQ_CSCT);
+            return true;
+        }
+        filterNumber = filter.failOutput;
+    }
+    return false;
 }
 
 void CDBlock::CmdGetCopyError() {
@@ -3071,14 +3138,15 @@ void CDBlock::CmdGetCopyError() {
     // <blank>
     // <blank>
 
-    devlog::info<grp::base>("Get copy error command is unimplemented");
-
     // Output structure:
     // status code   error code
     // <blank>
     // <blank>
     // <blank>
-    m_RR[0] = (GetStatusCode() << 8u) | 0x00; // TODO: async copy/move error code
+    // A zero error code means that the previous copy/move completed without
+    // an error. The command itself is implemented even though the full
+    // asynchronous error history is not retained yet.
+    m_RR[0] = (GetStatusCode() << 8u);
     m_RR[1] = 0x0000;
     m_RR[2] = 0x0000;
     m_RR[3] = 0x0000;

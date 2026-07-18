@@ -216,6 +216,9 @@ private:
     uint32 SetupFileInfoTransfer(uint32 fileID);
     bool SetupSubcodeTransfer(uint8 type);
 
+    // Route a buffer through a filter as the CD-block copy/move commands do.
+    bool RouteBufferToFilter(uint8 filterNumber, const Buffer &buffer);
+
     void ReadSector();
 
     uint16 DoReadTransfer();
