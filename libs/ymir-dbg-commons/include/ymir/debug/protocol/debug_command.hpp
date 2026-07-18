@@ -21,6 +21,7 @@ enum class CommandMethod {
     ExecReset,
     RegsRead,
     MemPeek,
+    MemPoke,
     VideoFrameHash,
     VideoCapture,
     DisasmAt,
@@ -42,6 +43,7 @@ constexpr std::string_view ToString(CommandMethod m) {
     case CommandMethod::ExecReset: return "exec.reset";
     case CommandMethod::RegsRead: return "regs.read";
     case CommandMethod::MemPeek: return "mem.peek";
+    case CommandMethod::MemPoke: return "mem.poke";
     case CommandMethod::VideoFrameHash: return "video.frame_hash";
     case CommandMethod::VideoCapture: return "video.capture";
     case CommandMethod::DisasmAt: return "disasm.at";

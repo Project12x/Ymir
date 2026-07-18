@@ -29,7 +29,8 @@ namespace {
     const std::vector<std::string> &Capabilities() {
         static const std::vector<std::string> capabilities{
             "sh2.master",    "sh2.slave",       "exec.continue",     "exec.pause",    "exec.run_for",
-            "exec.stepi",    "exec.reset",      "regs.read",         "mem.peek",      "video.frame_hash",
+            "exec.stepi",    "exec.reset",      "regs.read",         "mem.peek",      "mem.poke",
+            "video.frame_hash",
             "video.capture", "instance.status", "instance.shutdown", "event.stopped",
         };
         return capabilities;
@@ -676,6 +677,46 @@ nlohmann::json DebugService::DispatchRequest(const JsonRpcRequest &request) {
             {"target", TargetJson(*target)},
             {"address", *address},
             {"data", std::move(data)},
+        });
+    }
+
+    if (request.method == ToString(CommandMethod::MemPoke)) {
+        if (!HasOnlyKeys(request.params, {"target", "address", "data"}) || !request.params.contains("address") ||
+            !request.params.contains("data")) {
+            return invalidParams(ErrorCode::InvalidParams, "mem.poke expects target (optional), address and data");
+        }
+        if (auto error = requirePaused()) {
+            return *error;
+        }
+        const auto target = ParseTarget(request.params);
+        if (!target) {
+            return invalidParams(ErrorCode::InvalidTarget, "target must be sh2.master or sh2.slave");
+        }
+        if (!IsTargetEnabled(*target)) {
+            return serverError(ErrorCode::TargetDisabled, "target is not currently enabled");
+        }
+        const auto address = ParseUint32(request.params["address"]);
+        if (!address || !request.params["data"].is_array() || request.params["data"].empty() ||
+            request.params["data"].size() > kMaxPeekBytes ||
+            *address > std::numeric_limits<uint32_t>::max() - (request.params["data"].size() - 1)) {
+            return invalidParams(ErrorCode::MemoryOutOfRange, "data must contain 1..65536 bytes without address wrap");
+        }
+
+        auto &cpu = *target == DebugTarget::Sh2Master ? m_saturn->masterSH2 : m_saturn->slaveSH2;
+        auto &probe = cpu.GetProbe();
+        uint32_t offset = 0;
+        for (const auto &item : request.params["data"]) {
+            const auto value = ParseUint32(item);
+            if (!value || *value > 0xFFU) {
+                return invalidParams(ErrorCode::InvalidParams, "mem.poke data values must be bytes");
+            }
+            probe.MemPokeByte(*address + offset, static_cast<uint8_t>(*value), true);
+            ++offset;
+        }
+        return success({
+            {"target", TargetJson(*target)},
+            {"address", *address},
+            {"bytes_written", offset},
         });
     }
 

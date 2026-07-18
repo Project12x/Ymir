@@ -38,6 +38,7 @@ The worker starts paused and emits `instance.ready`. Protocol version 0.3.0 impl
 - `exec.stepi`
 - `regs.read`
 - `mem.peek`
+- `mem.poke`
 - `video.frame_hash`
 - `video.capture`
 
@@ -45,6 +46,11 @@ The worker starts paused and emits `instance.ready`. Protocol version 0.3.0 impl
 string addresses, and limits each response to 64 KiB. Slave SH-2 commands return `target_disabled` until the emulated
 SMPC has enabled that processor; `--no-slave` also hides it from remote access but does not modify Saturn hardware
 behavior.
+
+`mem.poke` is the corresponding paused-only diagnostic write. It accepts a
+target, address, and 1–65536 byte `data` array, bypasses the emulated cache,
+and returns the byte count written. It is unavailable while the instance is
+running; clients should record every write in their evidence report.
 
 `exec.continue` transfers Saturn ownership to one execution thread. Core inspection commands remain rejected with
 `invalid_state` until `exec.pause` has waited for `RunFrame()` to return and the instance is actually quiescent. The
