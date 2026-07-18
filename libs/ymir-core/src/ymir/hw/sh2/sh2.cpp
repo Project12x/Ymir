@@ -368,6 +368,15 @@ void SH2::Reset(bool hard, bool watchdogInitiated) {
     RTCNT = 0x0000;
     RTCOR = 0x0000;
 
+    // SCI reset state: transmitter empty and transmission complete. No
+    // external serial peer is connected, so receive data remains empty.
+    m_sciMode = 0x00;
+    m_sciBitRate = 0xFF;
+    m_sciControl = 0x00;
+    m_sciTransmit = 0xFF;
+    m_sciStatus = 0x84;
+    m_sciReceive = 0x00;
+
     DMAOR.Reset();
     for (auto &ch : m_dmaChannels) {
         ch.Reset();
@@ -1042,7 +1051,12 @@ FORCE_INLINE_EX uint8 SH2::OnChipRegReadByte(uint32 address) {
     }
 
     switch (address) {
-    case 0x04: return 0; // TODO: SCI SSR
+    case 0x00: return m_sciMode;    // SCSMR
+    case 0x01: return m_sciBitRate; // SCBRR
+    case 0x02: return m_sciControl; // SCSCR
+    case 0x03: return m_sciTransmit; // SCTDR
+    case 0x04: return m_sciStatus;  // SCSSR
+    case 0x05: return m_sciReceive; // SCRDR
     case 0x10: return FRT.ReadTIER();
     case 0x11:
         if constexpr (!peek) {
@@ -1314,6 +1328,21 @@ FORCE_INLINE_EX void SH2::OnChipRegWriteByte(uint32 address, uint8 value) {
     }
 
     switch (address) {
+    case 0x00: m_sciMode = value; break;
+    case 0x01: m_sciBitRate = value; break;
+    case 0x02: m_sciControl = value; break;
+    case 0x03:
+        m_sciTransmit = value;
+        // With no external peer, a byte leaves the transmitter immediately
+        // and the empty/complete flags remain asserted.
+        m_sciStatus |= 0x84;
+        break;
+    case 0x04:
+        // SSR flags are write-one-to-clear on hardware. Keep TDRE/TEND
+        // asserted because the emulated serial line is idle.
+        m_sciStatus &= static_cast<uint8>(value | 0x84);
+        break;
+    case 0x05: m_sciReceive = value; break;
     case 0x10:
         FRT.WriteTIER(value);
         if (FRT.FTCSR.ICF && FRT.TIER.ICIE) {

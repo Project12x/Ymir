@@ -835,7 +835,15 @@ private:
 
     // --- SCI module ---
 
-    // TODO
+    // The Saturn BIOS uses the SCI registers while bringing up its serial
+    // diagnostics path. Keep the register-visible state even though Ymir does
+    // not currently model an external SCI peer.
+    uint8 m_sciMode;
+    uint8 m_sciBitRate;
+    uint8 m_sciControl;
+    uint8 m_sciTransmit;
+    uint8 m_sciStatus;
+    uint8 m_sciReceive;
 
     // --- BSC module ---
 
